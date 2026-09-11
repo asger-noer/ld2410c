@@ -1,7 +1,6 @@
-//go:build rp2040 || rp2350
-
-// Package ld2410c binds the LD2410C serial protocol to a machine.UART and the
-// module's OUT pin.
+// Package ld2410c drives the HLK-LD2410C 24 GHz mmWave presence sensor over
+// UART. The UART and OUT pin are abstracted behind the UART and InputPin
+// interfaces so the package compiles and is testable on any host.
 //
 // All framing, command construction, and response parsing lives in the codec
 // subpackage, which imports no hardware and is covered by host tests. This
@@ -13,12 +12,25 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"machine"
 	"sync"
 	"time"
 
 	"github.com/asger-noer/ld2410c/codec"
 )
+
+// UART is the serial transport required by Device. *machine.UART satisfies
+// this interface on TinyGo targets.
+type UART interface {
+	Buffered() int
+	Read(p []byte) (int, error)
+	Write(p []byte) (int, error)
+}
+
+// InputPin is the module's OUT pin, used for diagnostics. machine.Pin
+// satisfies this interface on TinyGo targets.
+type InputPin interface {
+	Get() bool
+}
 
 // Baud is the module's factory-default serial speed.
 const Baud = 256000
@@ -138,7 +150,7 @@ const frameQueue = 32
 // consume the ACK bytes the session is waiting for.
 type Device struct {
 	mu      sync.Mutex
-	uart    *machine.UART
+	uart    UART
 	scanner codec.Scanner
 	readBuf [readChunk]byte
 	cmdBuf  []byte
@@ -154,45 +166,12 @@ type Device struct {
 	runStart    time.Time
 	lastCommand time.Time
 
-	rx, tx, outPin machine.Pin
-	frames         chan codec.Frame
+	outPin InputPin
+	frames chan codec.Frame
 
 	logger *slog.Logger
 
 	stats Stats
-}
-
-// NewDevice configures the UART and OUT pin and returns a ready device. Call Run
-// in its own goroutine to begin decoding.
-//
-// The OUT pin is configured as an input for diagnostics but is not used to drive
-// anything. It carries the module's own one-bit presence verdict subject to the
-// module's hold time, which the decoded frame stream supersedes in every
-// respect.
-func NewDevice(tx, rx, out machine.Pin, uart *machine.UART) (*Device, error) {
-	uart.Configure(machine.UARTConfig{
-		BaudRate: Baud,
-		TX:       tx,
-		RX:       rx,
-	})
-
-	out.Configure(machine.PinConfig{Mode: machine.PinInputPulldown})
-
-	d := &Device{
-		uart:   uart,
-		rx:     rx,
-		tx:     tx,
-		outPin: out,
-		frames: make(chan codec.Frame, frameQueue),
-		cmdBuf: make([]byte, 0, 64),
-		// Default rather than nil: a nil *slog.Logger panics on use, so any
-		// method called before SetLogger would have brought the board down.
-		logger: slog.Default(),
-	}
-	if err := d.scanner.Reset(make([]byte, scanBuf)); err != nil {
-		return nil, fmt.Errorf("ld2410c: %w", err)
-	}
-	return d, nil
 }
 
 // SetLogger replaces the device's logger.
